@@ -38,9 +38,9 @@ test('tool names are unique and every path parameter is required', () => {
 test('deletes and removals warn to confirm the id first', () => {
   for (const t of TOOLS) if (/^clickup_(delete|remove)_/.test(t.name)) assert.match(t.description, /confirm the exact id/, t.name);
 });
-test('the 16 tools of v0.3 keep their names', () => {
-  const v03 = 'list_workspaces get_hierarchy filter_tasks list_tasks get_task create_task update_task create_folder update_folder create_list get_list update_list delete_list move_task add_tag_to_task remove_tag_from_task';
-  for (const n of v03.split(' ')) assert.ok(TOOLS.some(t => t.name === `clickup_${n}`), n);
+test('tools that existing callers use are served by name', () => {
+  const callerTools = 'list_workspaces get_hierarchy filter_tasks list_tasks get_task create_task update_task create_folder update_folder create_list get_list update_list delete_list move_task add_tag_to_task remove_tag_from_task';
+  for (const n of callerTools.split(' ')) assert.ok(TOOLS.some(t => t.name === `clickup_${n}`), n);
 });
 
 test('path parameters are filled and encoded; routing follows the first object in the path', () => {
