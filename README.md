@@ -94,10 +94,11 @@ path, query and body fields by their ClickUp names, at the top level.
   `task_ids=a&task_ids=b` and `group_ids` repeated bare; `custom_fields` as one JSON value.
 - **Uploads** (`create_task_attachment`, `create_attachment`) take a local `file_path`.
 - **Deletes and removals** say in their description to confirm the exact id with the user first.
-- **Kept from before, unchanged for callers** (existing callers rely on these):
+- **Shorthands existing callers rely on**:
   `create_task`/`update_task` also take `markdown_description`, `priority` as a word, `due_date`
   as `YYYY-MM-DD`; `filter_tasks` takes `folder_ids` (sent as `project_ids`);
   `filter_tasks`, `list_tasks` and `get_list` return summaries unless given `raw: true`;
+  `filter_tasks` and `list_tasks` return every page (`filter_tasks` never includes archived tasks);
   `update_list` keeps the current name when only `content` is given.
 
 ## Behaviour notes

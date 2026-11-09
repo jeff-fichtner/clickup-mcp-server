@@ -44,12 +44,12 @@ function loadTokens() {
   }
   return parseTokens(raw, `Keychain service '${KEYCHAIN_SERVICE}'`);
 }
-// Loaded once; a missing or malformed map is reported on every call (and at startup on stderr)
-// rather than letting calls go out with no token.
-let TOKENS = null, TOKENS_ERROR = null;
+// Loaded on first use and kept once it loads. Until then every call tries again and fails with
+// the reason, so a keychain that was locked at startup works as soon as it is unlocked, and no
+// call goes out without a token.
+let TOKENS = null;
 function tokens() {
-  if (!TOKENS && !TOKENS_ERROR) { try { TOKENS = loadTokens(); } catch (e) { TOKENS_ERROR = e.message; } }
-  if (TOKENS_ERROR) throw new Error(TOKENS_ERROR);
+  if (!TOKENS) TOKENS = loadTokens();
   return TOKENS;
 }
 
@@ -68,6 +68,25 @@ function throttle() {
   });
   return chain;
 }
+// How long to wait after a 429. ClickUp sends X-RateLimit-Reset (Unix seconds when the window
+// reopens); Retry-After may be seconds or an HTTP date. With neither, wait out a whole window.
+const RATE_WINDOW_MS = 60000;
+function retryDelayMs(headers, now = Date.now()) {
+  const until = ms => Math.min(Math.max(ms - now, 0), RATE_WINDOW_MS) + 1000;
+  const reset = Number(headers['x-ratelimit-reset']);
+  if (Number.isFinite(reset) && reset > 0) return until(reset * 1000);
+  const ra = headers['retry-after'];
+  if (ra !== undefined && ra !== '') {
+    const secs = Number(ra);
+    if (Number.isFinite(secs)) return until(now + secs * 1000);
+    const at = Date.parse(ra);
+    if (!Number.isNaN(at)) return until(at);
+  }
+  return RATE_WINDOW_MS + 1000;
+}
+// A request with no answer for this long fails, so one stalled connection cannot hold up every
+// call queued behind it.
+const REQUEST_TIMEOUT_MS = 60000;
 // A body is JSON, or { data: Buffer, contentType } for an upload.
 function rawRequest(method, path, body, attempt, token) {
   return new Promise((resolve, reject) => {
@@ -85,15 +104,15 @@ function rawRequest(method, path, body, attempt, token) {
           // by decoding each chunk on its own.
           const buf = Buffer.concat(chunks).toString('utf8');
           if (res.statusCode === 429 && attempt < 5) {
-            const ra = parseInt(res.headers['retry-after'] || '5', 10);
-            return setTimeout(() => rawRequest(method, path, body, attempt + 1, token).then(resolve, reject), (ra + 1) * 1000);
+            const retry = () => throttle().then(() => rawRequest(method, path, body, attempt + 1, token));
+            return setTimeout(() => retry().then(resolve, reject), retryDelayMs(res.headers));
           }
           // ClickUp sometimes emits RAW control chars inside string values (task
           // descriptions pasted from other tools), which is invalid JSON and makes strict
           // parsers throw. Escaped sequences are backslash+letter, not control bytes, so
           // stripping U+0000..U+001F only removes the illegal bytes and insignificant
-          // whitespace between tokens. Parse failure now surfaces loudly instead of
-          // silently handing the caller {raw:...} it will not understand.
+          // whitespace between tokens. A body that still does not parse is an error, not
+          // something handed to the caller.
           // Some writes (move folder) answer 200 with an empty body: that is success, not bad JSON.
           let json;
           if (!buf.trim()) json = {};
@@ -110,12 +129,16 @@ function rawRequest(method, path, body, attempt, token) {
         });
       }
     );
+    req.setTimeout(REQUEST_TIMEOUT_MS, () => req.destroy(new Error(`ClickUp did not answer ${method} ${path.split('?')[0]} within ${REQUEST_TIMEOUT_MS / 1000}s`)));
     req.on('error', reject);
     if (data) req.write(data);
     req.end();
   });
 }
-async function api(method, path, body, token) { await throttle(); return rawRequest(method, path, body, 0, token); }
+// The function that sends one HTTP request; tests replace it with a stand-in for ClickUp.
+let requester = rawRequest;
+function setRequester(fn) { requester = fn || rawRequest; }
+async function api(method, path, body, token) { await throttle(); return requester(method, path, body, 0, token); }
 
 // ---- routing: every call goes out with the token of the workspace it belongs to ----
 // ClickUp answers a token used outside its workspace with 401 OAUTH_023 ("Team(s) not
@@ -186,13 +209,15 @@ function queryString(variant, args) {
 function multipartBody(field, filePath, fields, filename) {
   const boundary = `----clickup-mcp-${Date.now().toString(16)}`;
   const parts = [];
+  // CR and LF would end a line early and let a value add headers or parts; quotes would end the
+  // quoted filename.
   for (const [k, v] of Object.entries(fields)) {
-    if (v === undefined) continue;
-    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+    if (v === undefined || v === null) continue;
+    const text = (typeof v === 'object' ? JSON.stringify(v) : String(v)).replace(/[\r\n]/g, '');
+    parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${text}\r\n`));
   }
-  // CR, LF and quotes would end the header line or the quoted value and let a name add headers.
   const name = (filename || nodePath.basename(filePath)).replace(/["\r\n]/g, '');
-  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${name.replace(/"/g, '')}"\r\nContent-Type: application/octet-stream\r\n\r\n`));
+  parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="${field}"; filename="${name}"\r\nContent-Type: application/octet-stream\r\n\r\n`));
   parts.push(fs.readFileSync(filePath));
   parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
   return { data: Buffer.concat(parts), contentType: `multipart/form-data; boundary=${boundary}` };
@@ -233,8 +258,8 @@ const call = (name, args) => sendRequest(buildRequest(BY_NAME.get(name), args));
 // ---- overrides: tools that do more than their one request ----
 const dueMs = d => (typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) ? new Date(d + 'T12:00:00').getTime() : d);
 const PRIORITY = { urgent: 1, high: 2, normal: 3, low: 4 };
-// create_task / update_task accept the shorthands they always have (markdown_description, priority
-// by word, due_date as YYYY-MM-DD) next to every field ClickUp takes.
+// create_task / update_task accept shorthands that callers rely on (markdown_description, priority
+// by word, due_date as YYYY-MM-DD) next to every field ClickUp takes. priority: null clears it.
 function taskArgs(a) {
   const out = { ...a };
   if (a.markdown_description !== undefined) out.markdown_content = a.markdown_description;
@@ -249,12 +274,9 @@ function taskArgs(a) {
 }
 // PUT /space/{id} takes the whole space, not a patch: every setting is sent back as read, so a
 // rename changes the name and nothing else.
-const renameSpaceBody = (space, name) => ({
-  name, color: space.color, private: space.private, admin_can_manage: space.admin_can_manage,
-  multiple_assignees: space.multiple_assignees, features: space.features,
-});
 const SPACE_FIELDS = ['name', 'color', 'private', 'admin_can_manage', 'multiple_assignees', 'features'];
 const pick = (a, keys) => Object.fromEntries(keys.filter(k => a[k] !== undefined).map(k => [k, a[k]]));
+const renameSpaceBody = (space, name) => ({ ...pick(space, SPACE_FIELDS), name });
 const folderSummary = f => ({ id: f.id, name: f.name, space: f.space && { id: f.space.id, name: f.space.name }, lists: (f.lists || []).map(l => ({ id: l.id, name: l.name })) });
 const taskSummary = t => ({ id: t.id, name: t.name, status: t.status && t.status.status, archived: t.archived, parent: t.parent, list: t.list && { id: t.list.id, name: t.list.name } });
 
@@ -269,13 +291,13 @@ const OVERRIDES = {
     return [...seen.values()];
   },
   async clickup_get_hierarchy({ team_id, space_id }) {
-    const spaces = space_id ? [await viaObject(`space:${space_id}`, team_id, 'GET', `/api/v2/space/${space_id}`)]
-                            : ((await viaTeam(team_id, 'GET', `/api/v2/team/${team_id}/space`)).spaces || []);
+    if (!given(team_id) && !given(space_id)) throw new Error('clickup_get_hierarchy: give team_id or space_id');
+    const spaces = given(space_id) ? [await call('clickup_get_space', { space_id, team_id })]
+                                   : ((await call('clickup_list_spaces', { team_id })).spaces || []);
     const out = [];
     for (const sp of spaces) {
-      const key = `space:${sp.id}`;
-      const folders = (await viaObject(key, team_id, 'GET', `/api/v2/space/${sp.id}/folder`)).folders || [];
-      const folderless = (await viaObject(key, team_id, 'GET', `/api/v2/space/${sp.id}/list`)).lists || [];
+      const folders = (await call('clickup_list_folders', { space_id: sp.id, team_id })).folders || [];
+      const folderless = (await call('clickup_list_folderless_lists', { space_id: sp.id, team_id })).lists || [];
       out.push({
         id: sp.id, name: sp.name, type: 'space',
         folders: folders.map(f => ({ id: f.id, name: f.name, lists: (f.lists || []).map(l => ({ id: l.id, name: l.name })) })),
@@ -285,11 +307,17 @@ const OVERRIDES = {
     return out;
   },
   async clickup_filter_tasks(a) {
-    // ClickUp's API still calls folders "projects"; folder_ids is the name this tool always took.
+    // Every matching task across all pages. ClickUp's API calls folders "projects"; this tool
+    // takes folder_ids and sends them as project_ids.
     const project_ids = a.project_ids || a.folder_ids;
-    const r = await call('clickup_filter_tasks', { ...a, project_ids, subtasks: a.subtasks !== undefined ? a.subtasks : true });
-    if (a.raw) return r;
-    return (r.tasks || []).map(t => ({ id: t.id, name: t.name, status: t.status && t.status.status, priority: t.priority && t.priority.priority, due_date: t.due_date, list: t.list && { id: t.list.id, name: t.list.name } }));
+    const out = [];
+    for (let page = 0; ; page++) {
+      const r = await call('clickup_filter_tasks', { ...a, project_ids, subtasks: a.subtasks !== undefined ? a.subtasks : true, page });
+      const ts = r.tasks || [];
+      for (const t of ts) out.push(a.raw ? t : { id: t.id, name: t.name, status: t.status && t.status.status, priority: t.priority && t.priority.priority, due_date: t.due_date, list: t.list && { id: t.list.id, name: t.list.name } });
+      if (r.last_page === true || ts.length < 100) break;
+    }
+    return out;
   },
   async clickup_list_tasks(a) {
     // Tasks of ONE list, with archived support and full pagination. The team-level
@@ -304,20 +332,15 @@ const OVERRIDES = {
     return out;
   },
   async clickup_create_task(a) { return call('clickup_create_task', taskArgs(a)); },
-  async clickup_update_task(a) {
-    const args = taskArgs(a);
-    // priority: null clears it; the word map above leaves null alone.
-    return call('clickup_update_task', args);
-  },
+  async clickup_update_task(a) { return call('clickup_update_task', taskArgs(a)); },
   async clickup_move_task(a) {
-    // Real move: v3 reassigns the task's HOME list. (v2 genuinely cannot do this — its
-    // POST /list/{id}/task/{id} is "add to an ADDITIONAL list" and leaves the original
-    // home list in place, which looks like a move and isn't. That was the old bug here.)
+    // Real move: v3 reassigns the task's HOME list. v2 cannot: its POST /list/{id}/task/{id}
+    // adds the task to an ADDITIONAL list and leaves the home list in place.
     // status_mappings is only needed when the task's current status doesn't exist in the
     // destination list; lists sharing a space-level status set need none.
     await call('clickup_move_task', { ...a, move_custom_fields: a.move_custom_fields !== false });
     // v3 returns no useful body; read back so the caller sees the truth, not our assumption.
-    const t = await viaTeam(a.team_id, 'GET', `/api/v2/task/${a.task_id}`);
+    const t = await call('clickup_get_task', { task_id: a.task_id, team_id: a.team_id });
     return { id: t.id, name: t.name, status: t.status && t.status.status, list: t.list && { id: t.list.id, name: t.list.name }, archived: t.archived };
   },
   async clickup_get_list(a) {
@@ -346,24 +369,24 @@ const OVERRIDES = {
     // Moves the folder with its lists and tasks to the top level of another space. ClickUp
     // answers with an empty body, so read back where the folder actually is.
     await call('clickup_move_folder', a);
-    return folderSummary(await viaObject(`folder:${a.folder_id}`, a.team_id, 'GET', `/api/v2/folder/${a.folder_id}`));
+    return folderSummary(await call('clickup_get_folder', { folder_id: a.folder_id, team_id: a.team_id }));
   },
   async clickup_create_space(a) {
     // With like_space_id, starts from that space's settings and applies the given fields on top.
     // Statuses are never copied: the API gives a new space ClickUp's default statuses.
     let body = pick(a, SPACE_FIELDS);
     if (a.like_space_id) {
-      const like = await viaObject(`space:${a.like_space_id}`, a.team_id, 'GET', `/api/v2/space/${a.like_space_id}`);
+      const like = await call('clickup_get_space', { space_id: a.like_space_id, team_id: a.team_id });
       body = { ...renameSpaceBody(like, a.name), ...body };
     }
-    const s = await viaTeam(a.team_id, 'POST', `/api/v2/team/${a.team_id}/space`, body);
+    // Sent directly: the spec's create body lists only some of the settings ClickUp accepts.
+    const s = await viaTeam(a.team_id, 'POST', `/api/v2/team/${encodeURIComponent(a.team_id)}/space`, body);
     return { id: s.id, name: s.name, statuses: (s.statuses || []).map(x => ({ status: x.status, type: x.type })) };
   },
   async clickup_update_space(a) {
-    const key = `space:${a.space_id}`;
-    const space = await viaObject(key, a.team_id, 'GET', `/api/v2/space/${a.space_id}`);
+    const space = await call('clickup_get_space', { space_id: a.space_id, team_id: a.team_id });
     const body = { ...renameSpaceBody(space, space.name), ...pick(a, SPACE_FIELDS) };
-    const s = await viaObject(key, a.team_id, 'PUT', `/api/v2/space/${a.space_id}`, body);
+    const s = await call('clickup_update_space', { space_id: a.space_id, team_id: a.team_id, ...body });
     return { id: s.id, name: s.name };
   },
 };
@@ -381,8 +404,10 @@ const SCHEMA_PATCHES = {
     s.properties.priority = { description: 'urgent | high | normal | low, 1-4, or null to clear' };
     s.properties.due_date = { description: 'YYYY-MM-DD, or Unix ms' };
   },
-  clickup_filter_tasks: s => {
-    s.properties.raw = RAW;
+  clickup_filter_tasks: (s, t) => {
+    t.description = 'Tasks across a workspace matching the filters, every page. Archived tasks are never included (use clickup_list_tasks for an archived list); closed tasks only with include_closed.';
+    delete s.properties.page;
+    s.properties.raw = { type: 'boolean', description: "Return ClickUp's full task objects instead of summaries" };
     s.properties.folder_ids = { type: 'array', items: { type: 'string' }, description: 'Folder ids (sent as project_ids)' };
   },
   clickup_update_list: s => { s.required = ['list_id']; },
@@ -407,6 +432,8 @@ const TOOLS = GENERATED.map(t => {
   return tool;
 });
 TOOLS.push({ name: 'clickup_get_hierarchy', description: 'Spaces + folders + lists for a team (team_id) or a single space (space_id).', inputSchema: { type: 'object', properties: { team_id: { type: 'string' }, space_id: { type: 'string' } }, required: [] } });
+// The hierarchy needs team_id or space_id; JSON Schema's required cannot say "one of", so the
+// tool checks it and names both.
 
 async function runTool(name, args) {
   if (OVERRIDES[name]) return OVERRIDES[name](args);
@@ -420,25 +447,28 @@ async function runTool(name, args) {
 function send(o) { process.stdout.write(JSON.stringify(o) + '\n'); }
 
 // ---- tools/call runs STRICTLY ONE AT A TIME ----
-// readline fires a fresh async handler per line and never awaits the previous one, so
-// pipelined calls used to interleave. That cost nothing in throughput (throttle() already
-// serialises every HTTP request) and cost correctness twice: a multi-step tool such as
-// move_task (PUT home_list, then read back) could have another call land between its two
-// steps, and a caller's write + read-back of the same object could resolve out of order and
-// report a successful rename as failed.
+// readline fires a fresh async handler per line and never awaits the previous one, so without
+// this queue pipelined calls would interleave. Running them in order costs no throughput
+// (throttle() serialises every HTTP request anyway) and keeps two things correct: a multi-step
+// tool such as move_task (PUT home_list, then read back) has no other call land between its
+// steps, and a caller's write and read-back of the same object resolve in the order sent.
 // Protocol methods (initialize / tools/list / ping) are deliberately NOT queued — they touch
 // no API, and making a health-check wait behind a long tool backlog is how clients time out.
+// A tool that fails answers with isError and ClickUp's message as its content, as MCP specifies
+// for tool errors, so the model sees what went wrong and can correct the call.
+async function toolResult(name, args) {
+  try {
+    return { content: [{ type: 'text', text: JSON.stringify(await runTool(name, args)) }] };
+  } catch (e) {
+    return { content: [{ type: 'text', text: String((e && e.message) || e) }], isError: true };
+  }
+}
 let callQueue = Promise.resolve();
 function enqueueCall(id, params) {
   callQueue = callQueue.then(async () => {
     const name = params && params.name;
-    if (!OVERRIDES[name] && !BY_NAME.has(name)) return send({ jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown tool ${name}` } });
-    try {
-      const result = await runTool(name, (params && params.arguments) || {});
-      send({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(result) }] } });
-    } catch (e) {
-      if (id !== undefined) send({ jsonrpc: '2.0', id, error: { code: -32000, message: String((e && e.message) || e) } });
-    }
+    if (!OVERRIDES[name] && !BY_NAME.has(name)) return send({ jsonrpc: '2.0', id, error: { code: -32602, message: `Unknown tool ${name}` } });
+    send({ jsonrpc: '2.0', id, result: await toolResult(name, (params && params.arguments) || {}) });
   });
   // A rejection here would poison the chain and silently wedge every later call; the inner
   // try/catch should prevent it, so this is a belt-and-braces reset rather than a handler.
@@ -472,4 +502,4 @@ rl.on('line', line => {
 try { tokens(); } catch (e) { process.stderr.write(`ERROR: ${e.message}\n`); }
 }
 
-module.exports = { parseTokens, isScopeMiss, renameSpaceBody, buildRequest, multipartBody, taskArgs, TOOLS, BY_NAME };
+module.exports = { parseTokens, isScopeMiss, renameSpaceBody, buildRequest, multipartBody, taskArgs, retryDelayMs, toolResult, setRequester, TOOLS, BY_NAME };
