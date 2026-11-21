@@ -159,6 +159,16 @@ test('a 429 is retried after the reset ClickUp gives, then succeeds', async () =
   } finally { restore(); }
 });
 
+test('a body passed whole goes to ClickUp as given, a bare value included', async () => {
+  const calls = fakeClickUp(() => ({}));
+  const list = [{ assignee: 1, time: 60 }];
+  const r1 = await toolResult('clickup_replace_time_estimates_by_user', { team_id: '111', task_id: 'T1', body: list });
+  const r2 = await toolResult('clickup_replace_time_estimates_by_user', { team_id: '111', task_id: 'T1', body: 'not a list' });
+  assert.strictEqual(r1.isError, undefined);
+  assert.strictEqual(r2.isError, undefined);
+  assert.deepStrictEqual(calls.map(c => c.body), [list, 'not a list']);
+});
+
 test('tokens that fail to load are tried again on the next call', async () => {
   delete require.cache[modPath];
   process.env.CLICKUP_TOKENS = 'not json';

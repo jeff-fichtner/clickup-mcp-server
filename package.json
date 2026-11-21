@@ -1,0 +1,15 @@
+{
+  "name": "clickup-mcp-server",
+  "private": true,
+  "description": "Self-hosted ClickUp MCP server. Runs with Node built-ins only; the devDependencies are for the type check.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
+  }
+}

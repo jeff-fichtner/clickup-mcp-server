@@ -6,10 +6,98 @@
 //   node scripts/generate-tools.js
 // (The v3 ".yaml" is served as JSON.) Fails on an operation with no name, on a name clash, and on
 // an argument that means two different things in one tool.
+// @ts-check
 'use strict';
 const fs = require('fs');
 const path = require('path');
 const { NAMES, EXCLUDED } = require('../names.js');
+
+// ---- what the specs hold: only the parts read here ----
+/**
+ * A schema as an OpenAPI spec writes it.
+ * @typedef {object} SpecSchema
+ * @property {string} [$ref]
+ * @property {SpecSchema[]} [allOf]
+ * @property {SpecSchema[]} [anyOf]
+ * @property {SpecSchema[]} [oneOf]
+ * @property {string | string[]} [type]
+ * @property {string} [description]
+ * @property {unknown[]} [enum]
+ * @property {SpecSchema} [items]
+ * @property {Record<string, SpecSchema>} [properties]
+ * @property {string[]} [required]
+ */
+/**
+ * @typedef {object} SpecParameter
+ * @property {string} name
+ * @property {'path' | 'query' | 'header' | 'cookie'} in
+ * @property {boolean} [required]
+ * @property {string} [description]
+ * @property {SpecSchema} [schema]
+ */
+/** @typedef {Record<string, { schema: SpecSchema }>} SpecContent */
+/**
+ * @typedef {object} SpecOperation
+ * @property {string} operationId
+ * @property {string} [summary]
+ * @property {string} [description]
+ * @property {SpecParameter[]} [parameters]
+ * @property {{ content?: SpecContent, $ref?: string }} [requestBody]
+ */
+/**
+ * @typedef {object} SpecDoc
+ * @property {Record<string, Partial<Record<string, SpecOperation>>>} paths
+ */
+
+// ---- what the generator makes: tools.generated.json, which the server serves ----
+/**
+ * A JSON schema a model can fill in (what `simplify` makes of a SpecSchema).
+ * @typedef {object} Schema
+ * @property {string} [type]
+ * @property {string} [description]
+ * @property {unknown[]} [enum]
+ * @property {Schema} [items]
+ * @property {Record<string, Schema>} [properties]
+ * @property {string[]} [required]
+ */
+/**
+ * One query parameter and how ClickUp wants it on the wire.
+ * @typedef {object} QueryParam
+ * @property {string} wire
+ * @property {'plain' | 'json' | 'repeat' | 'brackets'} style
+ * @property {boolean} required
+ */
+/**
+ * What a request sends as its body: nothing, JSON (the named fields, or `body` whole when raw),
+ * or a multipart upload of one file plus the named fields.
+ * @typedef {{ kind: 'none', props: string[] }
+ *   | { kind: 'json', props: string[], raw?: boolean }
+ *   | { kind: 'multipart', field: string, props: string[] }} Body
+ */
+/**
+ * One API operation behind a tool.
+ * @typedef {object} Variant
+ * @property {string} operationId
+ * @property {string} method
+ * @property {string} path
+ * @property {string[]} pathParams
+ * @property {QueryParam[]} query
+ * @property {Body} body
+ */
+/**
+ * @typedef {object} InputSchema
+ * @property {'object'} type
+ * @property {Record<string, Schema>} properties
+ * @property {string[]} required
+ */
+/**
+ * One tool as tools.generated.json holds it.
+ * @typedef {object} Tool
+ * @property {string} name
+ * @property {string} description
+ * @property {Variant[]} variants
+ * @property {InputSchema} inputSchema
+ */
 
 const ROOT = path.join(__dirname, '..');
 const SPECS = ['spec/clickup-api-v2.json', 'spec/clickup-api-v3.json'];
@@ -23,6 +111,7 @@ const DESTRUCTIVE = new Set(['mergeTasks', 'replaceTimeEstimatesByUser']);
 
 // Where the published spec is wrong, as observed against the live API. Keyed by operationId, then
 // argument; each value replaces that argument's schema, and `optional: true` un-requires it.
+/** @type {Record<string, Record<string, Schema & { optional?: boolean }>>} */
 const SPEC_FIXES = {
   // The spec requires both; a dependency is removed by naming one side of it.
   DeleteDependency: {
@@ -38,25 +127,46 @@ const SPEC_FIXES = {
   deleteChatReaction: { reaction: { type: 'string', description: 'Emoji name as ClickUp spells it, e.g. "+1" (not the emoji itself)' } },
 };
 
+/**
+ * @param {unknown} s
+ * @param {number} n
+ * @returns {string}
+ */
 const trim = (s, n) => {
-  s = String(s || '').replace(/\s+/g, ' ').trim();
-  return s.length > n ? s.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : s;
+  const t = String(s || '').replace(/\s+/g, ' ').trim();
+  return t.length > n ? t.slice(0, n - 1).replace(/\s+\S*$/, '') + '…' : t;
 };
 
+/**
+ * What a local `$ref` points at. The caller says what it expects to find there.
+ * @param {SpecDoc} doc
+ * @param {string} ref
+ * @returns {any}
+ */
 function pointer(doc, ref) {
   if (!ref.startsWith('#/')) throw new Error(`external $ref not supported: ${ref}`);
-  return ref.slice(2).split('/').reduce((o, k) => o[k.replace(/~1/g, '/').replace(/~0/g, '~')], doc);
+  return ref.slice(2).split('/').reduce((/** @type {any} */ o, k) => o[k.replace(/~1/g, '/').replace(/~0/g, '~')], doc);
 }
 
 // A JSON schema a model can fill in: $refs resolved, allOf merged, anyOf/oneOf of objects merged
 // into one object (SetCustomFieldValue takes one of several shapes of `value`), examples dropped.
+/**
+ * @param {SpecDoc} doc
+ * @param {SpecSchema | undefined} schema
+ * @param {number} [depth]
+ * @param {Set<string>} [seen]
+ * @returns {Schema}
+ */
 function simplify(doc, schema, depth = 0, seen = new Set()) {
   if (!schema || typeof schema !== 'object') return {};
   if (schema.$ref) {
     if (seen.has(schema.$ref) || depth > MAX_DEPTH) return { type: 'object' };
     return simplify(doc, pointer(doc, schema.$ref), depth, new Set([...seen, schema.$ref]));
   }
-  if (depth > MAX_DEPTH) return schema.type ? { type: schema.type } : {};
+  if (depth > MAX_DEPTH) {
+    const type = jsonType(schema);
+    return type ? { type } : {};
+  }
   if (schema.allOf) {
     const parts = schema.allOf.map(s => simplify(doc, s, depth, seen));
     return mergeObjects(parts, schema.description, true);
@@ -66,32 +176,57 @@ function simplify(doc, schema, depth = 0, seen = new Set()) {
     const parts = alts.map(s => simplify(doc, s, depth, seen));
     if (parts.every(p => p.type === 'object')) return mergeObjects(parts, schema.description, false);
     const types = [...new Set(parts.map(p => p.type).filter(Boolean))];
+    /** @type {Schema} */
     const out = types.length === 1 ? { type: types[0] } : {};
     if (schema.description) out.description = trim(schema.description, 200);
     return out;
   }
+  /** @type {Schema} */
   const out = {};
-  let type = Array.isArray(schema.type) ? schema.type.find(t => t !== 'null') : schema.type;
-  if (!type && schema.properties) type = 'object';
-  if (type) out.type = type === 'integer' || type === 'number' ? 'number' : type;
+  const type = jsonType(schema);
+  if (type) out.type = type;
   if (schema.description) out.description = trim(schema.description, 200);
   if (schema.enum) out.enum = schema.enum.filter(v => v !== null);
   if (type === 'array') out.items = simplify(doc, schema.items || {}, depth + 1, seen);
   if (schema.properties) {
-    out.properties = {};
-    for (const [k, v] of Object.entries(schema.properties)) out.properties[k] = simplify(doc, v, depth + 1, seen);
-    if (schema.required && schema.required.length) out.required = schema.required.filter(r => r in out.properties);
+    /** @type {Record<string, Schema>} */
+    const props = {};
+    for (const [k, v] of Object.entries(schema.properties)) props[k] = simplify(doc, v, depth + 1, seen);
+    out.properties = props;
+    if (schema.required && schema.required.length) out.required = schema.required.filter(r => r in props);
   }
   return out;
 }
+// The one JSON type a model is given: the non-null one of a nullable type, `object` for a schema
+// that only lists properties, and `number` for integers too.
+/**
+ * @param {SpecSchema} schema
+ * @returns {string | undefined}
+ */
+function jsonType(schema) {
+  let type = Array.isArray(schema.type) ? schema.type.find(t => t !== 'null') : schema.type;
+  if (!type && schema.properties) type = 'object';
+  return type === 'integer' ? 'number' : type;
+}
+/**
+ * @param {Schema[]} parts
+ * @param {string | undefined} description
+ * @param {boolean} keepRequired true for allOf (every part's required fields), false for
+ *   anyOf/oneOf (only the fields every alternative requires)
+ * @returns {Schema}
+ */
 function mergeObjects(parts, description, keepRequired) {
-  const out = { type: 'object', properties: {} };
+  /** @type {Record<string, Schema>} */
+  const properties = {};
+  /** @type {Schema} */
+  const out = { type: 'object', properties };
+  /** @type {string[]} */
   const required = [];
   for (const p of parts) {
     for (const [k, v] of Object.entries(p.properties || {})) {
-      const prev = out.properties[k];
+      const prev = properties[k];
       // The same field typed differently across alternatives: say nothing rather than one wrong type.
-      out.properties[k] = prev && JSON.stringify(prev) !== JSON.stringify(v) ? (v.description ? { description: v.description } : {}) : v;
+      properties[k] = prev && JSON.stringify(prev) !== JSON.stringify(v) ? (v.description ? { description: v.description } : {}) : v;
     }
     if (keepRequired) required.push(...(p.required || []));
   }
@@ -104,6 +239,11 @@ function mergeObjects(parts, description, keepRequired) {
   return out;
 }
 
+/**
+ * @param {SpecOperation} op
+ * @param {string} method
+ * @returns {string}
+ */
 function describe(op, method) {
   const first = trim(String(op.description || '').replace(/\\\s/g, ' ').split(/(?<=\.)\s/)[0], 220);
   let d = trim(op.summary || op.operationId, 120);
@@ -113,14 +253,24 @@ function describe(op, method) {
   return d;
 }
 
+/**
+ * One operation as a tool variant, plus the arguments it takes and which of them it requires.
+ * @param {SpecDoc} doc
+ * @param {string} method
+ * @param {string} rawPath
+ * @param {SpecOperation} op
+ * @returns {Variant & { props: Record<string, Schema>, required: string[] }}
+ */
 function variantOf(doc, method, rawPath, op) {
   const params = op.parameters || [];
+  /** @type {string[]} */
   const pathParams = [];
   const apiPath = rawPath.replace(/\{([^}]+)\}/g, (_, p) => {
     const arg = TEAM_PARAMS.has(p) ? 'team_id' : p;
     pathParams.push(arg);
     return `{${arg}}`;
   });
+  /** @type {Record<string, Schema>} */
   const props = {};
   const required = new Set(pathParams);
   for (const p of params.filter(p => p.in === 'path')) {
@@ -131,6 +281,7 @@ function variantOf(doc, method, rawPath, op) {
     if (p.description) props[arg].description = trim(p.description, 200);
   }
   for (const a of pathParams) if (!props[a]) props[a] = { type: 'string' };
+  /** @type {QueryParam[]} */
   const query = [];
   for (const p of params.filter(p => p.in === 'query')) {
     const wire = p.name.replace(/\[\]$/, '');
@@ -138,6 +289,7 @@ function variantOf(doc, method, rawPath, op) {
     const desc = String(p.description || '');
     // How ClickUp wants each array on the wire, read from the spec's own examples: `name=[{…}]` is
     // one JSON value, `name=a&name=b` repeats the bare name, and anything else takes `name[]=`.
+    /** @type {QueryParam['style']} */
     let style = 'plain';
     if (new RegExp(`${wire}=\\[\\{`).test(desc)) style = 'json';
     else if (new RegExp(`${wire}=[^&\`\\s]*&${wire}=`).test(desc)) style = 'repeat';
@@ -152,7 +304,9 @@ function variantOf(doc, method, rawPath, op) {
     if (desc && !props[wire].description) props[wire].description = trim(desc.replace(/\\\s/g, ' '), 200);
     if (isRequired) required.add(wire);
   }
+  /** @type {Body} */
   let body = { kind: 'none', props: [] };
+  /** @type {SpecContent | undefined} */
   const content = op.requestBody && (op.requestBody.content || (op.requestBody.$ref && pointer(doc, op.requestBody.$ref).content));
   if (content && content['multipart/form-data']) {
     // The file part is `attachment` (v2 names it; v3's schema lists only its text fields).
@@ -190,10 +344,17 @@ function variantOf(doc, method, rawPath, op) {
   return { operationId: op.operationId, method: method.toUpperCase(), path: apiPath, pathParams, query, body, props, required: [...required] };
 }
 
+/**
+ * Every tool, sorted by name.
+ * @returns {Tool[]}
+ */
 function generate() {
+  /** @type {Map<string, { name: string, descriptions: string[], variants: ReturnType<typeof variantOf>[] }>} */
   const byName = new Map();
+  /** @type {Set<string>} */
   const seenOps = new Set();
   for (const file of SPECS) {
+    /** @type {SpecDoc} */
     const doc = JSON.parse(fs.readFileSync(path.join(ROOT, file), 'utf8'));
     for (const [rawPath, ops] of Object.entries(doc.paths)) {
       for (const method of METHODS) {
@@ -205,8 +366,11 @@ function generate() {
         if (EXCLUDED[id]) continue;
         const name = NAMES[id];
         if (!name) throw new Error(`No tool name for ${id} (${method.toUpperCase()} ${rawPath}): add it to names.js`);
-        if (!byName.has(name)) byName.set(name, { name, descriptions: [], variants: [] });
-        const t = byName.get(name);
+        let t = byName.get(name);
+        if (!t) {
+          t = { name, descriptions: [], variants: [] };
+          byName.set(name, t);
+        }
         t.descriptions.push(describe(op, method));
         t.variants.push(variantOf(doc, method, rawPath.startsWith('/api/') ? rawPath : `/api${rawPath}`, op));
       }
@@ -215,8 +379,10 @@ function generate() {
   for (const id of [...Object.keys(NAMES), ...Object.keys(EXCLUDED)]) {
     if (!seenOps.has(id)) throw new Error(`names.js names ${id}, which is not in the specs`);
   }
+  /** @type {Tool[]} */
   const tools = [];
   for (const t of byName.values()) {
+    /** @type {Record<string, Schema>} */
     const props = {};
     for (const v of t.variants) Object.assign(props, v.props);
     let required = t.variants[0].required.filter(r => t.variants.every(v => v.required.includes(r)));

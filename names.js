@@ -1,3 +1,4 @@
+// @ts-check
 'use strict';
 // Tool name for every operation in ClickUp's public API (spec/), keyed by the spec's operationId.
 // The generator fails on an operation missing from both maps, so a new ClickUp endpoint is noticed
@@ -5,6 +6,7 @@
 // Two operations may share a name when they differ only by parent (a list in a folder or folderless
 // in a space): the tool takes either parent id and calls the operation whose path it fills.
 
+/** @type {Record<string, string>} operationId → tool name */
 const NAMES = {
   // ---- workspaces, users, roles ----
   GetAuthorizedTeams: 'clickup_list_workspaces',
@@ -210,6 +212,7 @@ const NAMES = {
 };
 
 // Operations deliberately left out, with the reason.
+/** @type {Record<string, string>} operationId → why it has no tool */
 const EXCLUDED = {
   GetAccessToken: 'OAuth code exchange for third-party apps; this server authenticates with personal tokens.',
 };
