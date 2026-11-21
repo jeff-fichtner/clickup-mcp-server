@@ -152,3 +152,14 @@ test('an upload is named by filename (v2 too), with CR, LF and quotes stripped',
 test('merge and replace-estimates warn like deletes do', () => {
   for (const n of ['clickup_merge_tasks', 'clickup_replace_time_estimates_by_user']) assert.match(TOOLS.find(t => t.name === n).description, /confirm the exact id/, n);
 });
+test('the server needs nothing installed: no runtime dependencies, and only built-in modules required', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+  assert.strictEqual(pkg.dependencies, undefined);
+  const { builtinModules } = require('module');
+  for (const f of ['clickup-stdio.js', 'names.js']) {
+    const src = fs.readFileSync(path.join(__dirname, '..', f), 'utf8');
+    for (const [, mod] of src.matchAll(/require\('([^']+)'\)/g)) {
+      assert.ok(builtinModules.includes(mod.replace(/^node:/, '')), `${f} requires ${mod}`);
+    }
+  }
+});

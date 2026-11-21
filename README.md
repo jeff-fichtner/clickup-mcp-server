@@ -55,7 +55,16 @@ token (`401 OAUTH_025`) included, fails at once. A wrong-workspace attempt is re
 before it does anything, so trying a write is safe. `list_workspaces` merges every workspace the
 map reaches.
 
-Unit tests: `node --test` (built-in runner, no install).
+## Checks
+
+- **Unit tests:** `node --test` (built-in runner, no install).
+- **Type check:** `npm ci` once, then `npm run typecheck`. The source is plain JavaScript with
+  `// @ts-check` and JSDoc types; `tsc` reads it with `checkJs` and emits nothing. TypeScript and
+  `@types/node` are devDependencies, used only by this check: running the server still needs no
+  install, and a test fails if `package.json` gains a runtime dependency or the server requires
+  anything but a Node built-in.
+- `npm run check` runs both. CI (`.github/workflows/check.yml`) runs the tests before installing
+  anything, then the type check.
 
 ## Smoke test
 
